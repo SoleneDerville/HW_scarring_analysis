@@ -1,0 +1,1095 @@
+---
+title: "Rates of entanglement inferred from scarring of humpback whales photographed in US Oregon waters"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+  bookdown::html_document2:
+    highlight: pygments
+    number_sections: true
+    toc: true
+    toc_float:
+        collapsed: false
+---
+
+```{r, echo=F, result="hide", include=F}
+# load packages
+lib = lapply(c("ordinal","maps","plyr", "tidyverse", "flextable", "patchwork", "viridis", "readxl","sf", "flextable", "officer", "FactoMineR","sf", "corrplot", "mgcv", "gratia", "png", "broom", "LaCroixColoR", "rnaturalearth"), library, character.only=TRUE)
+
+# load personalized ggplot theme and color palettes
+source("./Inputs/mon_theme.R")
+pal_robbins <-  rev(lacroix_palette("Lime", n = 5, type = "continuous"))
+pal_wall <- rev(lacroix_palette("Lemon", n = 4, type = "continuous"))
+```
+
+# Load data
+
+Shapefiles
+```{r}
+# coastline shapefile
+coast_sf <- st_read("./Inputs/coast_openstreetmap_WA-OR-CA.shp")
+
+# isobaths
+iso_sf <- st_read("./Inputs/isobaths_50mto1500m.shp")
+iso_sf_utm <- st_transform(iso_sf, crs = 32610)
+
+# places names
+places <- data.frame(name = c("Astoria", "Newport", "Charleston", "Brookings", "Garibaldi", "Cascade Head", "Bandon", "Winchester Bay", "Port Orford"),
+                      lon = c(-123.65, -123.75,-123.97, -123.96, -123.59, -123.5, -124.15, -123.7, -124.11),
+                      lat = c(46.1,  44.6, 43.3, 42.08, 45.55, 45.07, 43.12, 43.67, 42.76),
+                     type = c(rep("cities", 5), rep("zones", 2), rep("cities", 2))) 
+places <- st_as_sf(places, coords = c("lon", "lat"), crs = 4326)
+```
+
+Inset map
+```{r, eval = T}
+# US small map
+northam <- ne_countries(scale = "medium", returnclass = "sf", continent = "North America") %>% 
+  filter(admin %in% c("United States of America", "Canada", "Mexico"))
+
+# oregon
+or <- maps::map("state", plot = F, fill = TRUE) %>% 
+  st_as_sf() %>% 
+  filter(ID == "oregon")
+
+g <- ggplot(northam) +
+  geom_sf(fill = "grey95", col = "grey30", lwd = 0.1) +
+  geom_sf(data = or, fill = "lightblue", col = "grey30", lwd = 0.1) +
+  coord_sf(xlim = c(-170, -68), ylim=c(20, 72)) +
+  theme_void() +
+  theme(panel.border = element_rect(color = "grey95", fill = "transparent", linewidth = 1))
+ggsave(g, file = "./Outputs/inset_fig.png", bg = "transparent", units = "mm", width = 50, height = 40, dpi = 800)
+```
+
+Load datasets prepared as RData
+```{r}
+load("./Inputs/score_df.RData")
+```
+
+# Summarize data
+
+## Scores per photo
+
+Filter and change factor levels
+```{r}
+score_df <- score_df %>% 
+  # remove quality 4 photos
+  filter(Quality != "QUA4") %>% 
+  # remove positions outside Oregon waters
+  filter(lat >= 41.9 & lat <= 46.3) %>% 
+  # add a body part per side column
+  mutate(Body_part_side = paste(Body_part, Side, sep = "_")) %>% 
+  # change the factor levels to abbreviate photo types a.k.a Body_part
+  mutate(Body_part = car::recode(Body_part, "'Ventral tailstock' = 'Ventral T.'; 'Perpendicular tailstock'='Perpendicular T.';'Forward tailstock'='Forward T.'; 'Dorsal tailstock'='Dorsal T.'; 'Fluke underside' = 'Fluke'", as.numeric = F)) %>% 
+  mutate(Entang = factor(Entang, levels = c("ENT1-Most likely", "ENT2-Likely","ENT3-Possibly","ENT4-Unlikely")))
+```
+
+## Scores per individual per year
+
+### Wall et al. approach
+
+```{r}
+#########################################
+############ using left / right #########
+
+# best quality photo of highest entang score per body part per individual per year
+# for perp and forward we are selecting the best of rights and the best of the lefts
+score_best_byside_df <- score_df %>% 
+  ddply(., .(ID, Year, Body_part_side), function(d){
+    dd <- d %>% 
+      filter(Entang_num == min(Entang_num, na.rm = T)) %>% 
+      filter(Quality_num == min(Quality_num, na.rm = T))
+    return(dd[1,])
+  })
+
+#########################################
+############ merging left / right #######
+
+# same thing but using the highest score of both sides for left and right
+# for perpendicular and forward photos, if there is a left and a right photo it's going to pick the one with highest proba of entanglement between the two
+score_best_df <- score_df %>% 
+  ddply(., .(ID, Year, Body_part), function(d){
+    dd <- d %>% 
+      filter(Entang_num == min(Entang_num, na.rm = T)) %>% 
+      filter(Quality_num == min(Quality_num, na.rm = T))
+    return(dd[1,])
+  })
+```
+
+### Robbins & Mattila approach
+
+Calculate E scores based on S scores that were estimated for every region of the perpendicular or forward tailstock photos
+```{r, warning = F}
+perp_df <- score_df %>% 
+  # select only the perpendicular and forward photo types
+  filter(Body_part %in% c("Perpendicular T." , "Forward T.")) %>% 
+  # convert scores to numeric values
+  mutate(Perp_DP = as.numeric(str_split_i(Perp_DP, "-S", 2)),
+         Perp_VP = as.numeric(str_split_i(Perp_VP, "-S", 2)),
+         Perp_RFlank = as.numeric(str_split_i(Perp_RFlank, "-S", 2)),
+         Perp_RFluke = as.numeric(str_split_i(Perp_RFluke, "-S", 2)),
+         Perp_LFlank = as.numeric(str_split_i(Perp_LFlank, "-S", 2)),
+         Perp_LFluke = as.numeric(str_split_i(Perp_LFluke, "-S", 2))) %>% 
+  # by day and individual and body part (perp or forward), combine the scores of both sides when available
+  ddply(., .(ID, Date, Body_part), function(d){
+    if(nrow(d) > 1){
+      left <- d %>% filter(Side == "L")
+      right <- d %>% filter(Side == "R")
+      dd <- d[1, ] %>% 
+      # use the max entang score of the two sides for the ventral and dorsal score
+      mutate(Perp_DP = max(d$Perp_DP, na.rm = T),
+               Perp_VP = max(d$Perp_VP, na.rm = T),
+               Perp_RFlank = right$Perp_RFlank,
+               Perp_LFlank = left$Perp_LFlank,
+               Perp_RFluke = right$Perp_RFluke,
+               Perp_LFluke = left$Perp_LFluke,
+               Entang_num = min(d$Entang_num, na.rm = T),
+               Quality_num = min(d$Quality_num, na.rm = T))
+    } else {
+      dd <- d}
+    # replace -Inf by NA when max() introduced Inf
+    dd <- dd %>% 
+      mutate(Perp_DP = ifelse(Perp_DP == -Inf, NA, Perp_DP),
+             Perp_VP = ifelse(Perp_VP == -Inf, NA, Perp_VP))
+    return(dd)
+  })
+  
+# count the number of scores >= 1, >= 3 and >= 5
+perp_df$Count_S1 <- rowSums(perp_df[, c("Perp_DP", "Perp_VP", "Perp_RFlank", "Perp_RFluke", "Perp_LFlank", "Perp_LFluke")] >= 1, na.rm = T)
+perp_df$Count_S3 <- rowSums(perp_df[, c("Perp_DP", "Perp_VP", "Perp_RFlank", "Perp_RFluke", "Perp_LFlank", "Perp_LFluke")] >= 3, na.rm = T)
+perp_df$Count_S5 <- rowSums(perp_df[, c("Perp_DP", "Perp_VP", "Perp_RFlank", "Perp_RFluke", "Perp_LFlank", "Perp_LFluke")] >= 5, na.rm = T)
+perp_df$Count_noNA <- rowSums(!is.na(perp_df[, c("Perp_DP", "Perp_VP", "Perp_RFlank", "Perp_RFluke", "Perp_LFlank", "Perp_LFluke")]))
+
+# convert the scar codes by region to an entanglement status code per individual and date
+perp_df <- perp_df %>% 
+  mutate(Perp_Entang = case_when(Count_S1 == 0 ~ "E0",
+                                 Count_S1 >= 1 & Count_S3 == 0 ~ "E1",
+                                 Count_S3 == 1 & Count_S5 == 0 ~ "E2",
+                                 Count_S3 >= 2 & Count_S5 == 0 ~ "E3",
+                                 Count_S5 >= 1 ~ "E4")) %>% 
+  mutate(Perp_Entang = factor(Perp_Entang, levels = c("E4", "E3", "E2", "E1", "E0")),
+         Perp_Entang_num = as.numeric(Perp_Entang)) %>% 
+  select(ID, Date, Perp_DP, Perp_VP, Perp_RFlank, Perp_RFluke, Perp_LFlank, Perp_LFluke, Perp_Entang,  Perp_Entang_num, Entang_num, Count_noNA, Year, Sex, Quality_num, lon, lat)
+head(perp_df)
+```
+
+```{r, warning = F}
+perp_best_df <- perp_df %>% 
+  ddply(., .(ID, Year), function(d){
+    dd <- d %>% 
+      filter(Perp_Entang_num == min(Perp_Entang_num, na.rm = T))
+    return(dd[1,])
+  })
+```
+
+
+## Scores per individual
+
+### Wall et al. approach
+
+```{r}
+#########################################
+############ using left / right #########
+
+# best quality photo of highest entang score per body part per individual
+score_bestid_byside_df <- score_df %>% 
+  ddply(., .(ID, Body_part_side), function(d){
+    dd <- d %>% 
+      filter(Entang_num == min(Entang_num, na.rm = T)) %>% 
+      filter(Quality_num == min(Quality_num, na.rm = T))
+    return(dd[1,])
+  })
+
+#########################################
+############ merging left / right #######
+
+score_bestid_df <- score_df %>% 
+  ddply(., .(ID, Body_part), function(d){
+    dd <- d %>% 
+      filter(Entang_num == min(Entang_num, na.rm = T)) %>% 
+      filter(Quality_num == min(Quality_num, na.rm = T))
+    return(dd[1,])
+  })
+```
+
+### Robbins & Mattila approach
+
+```{r}
+perp_bestid_df <- perp_best_df %>% 
+  ddply(., ~ID, function(d){
+    dd <- d %>% 
+      filter(Perp_Entang_num == min(Perp_Entang_num, na.rm = T)) %>% 
+      filter(Quality_num == min(Quality_num, na.rm = T))
+    return(dd[1,])
+  })
+```
+
+# Overall numbers and descriptive stats
+
+## Describe dataset
+```{r}
+# total number of photos after filtering out the bad quality
+nrow(score_df)
+
+# contributions of collaborators
+# in photos
+table(score_df$Source)
+# in individuals
+score_df %>% 
+  group_by(Source) %>% 
+  summarize(ind = n_distinct(ID))
+  
+# number of photos contributed by fishermen
+length(str_subset(score_df$file, ".CBarnhart")) + length(str_subset(score_df$file, ".Josh"))
+score_df %>% 
+  filter(file %in% c(str_subset(score_df$file, ".CBarnhart"),
+                     str_subset(score_df$file, ".Josh"))) %>% 
+  summarize(ind = n_distinct(ID))
+
+# how many new cases of entang ind?
+d <- score_df %>% 
+  filter(file %in% c(str_subset(score_df$file, ".CBarnhart"),
+                     str_subset(score_df$file, ".Josh")),
+         Entang == "ENT1-Most likely")
+score_df[score_df$ID %in% unique(d$ID),]
+
+
+# how many unique IDs in Wall et al. approach
+n_distinct(score_best_df$ID)
+
+# how many unique IDs in Robbins & Mattila approach
+n_distinct(perp_best_df$ID)
+
+# how many year x IDs = encounters after removing within season resights
+n_distinct(paste0(score_best_df$ID, score_best_df$Year))
+
+# how many real unique IDs (not the NI)
+score_best_df %>% 
+  filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
+  summarize(unique_photoID = n_distinct(ID))
+
+# percent of NI in unique IDs
+(score_best_df %>% 
+  filter((substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
+  summarize(unique_photoID = n_distinct(ID)) %>% pull(unique_photoID)) * 100 /
+  n_distinct(score_best_df$ID)
+# percent photos from NI
+(score_df %>% 
+  filter((substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
+  summarize(nbphotos = n()) %>% pull(nbphotos)) * 100 /
+  nrow(score_df)
+
+# how many real unique IDs identified with Most likely entang
+score_best_df %>% 
+  filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
+  filter(Entang_num == 1) %>% 
+  summarize(unique_photoID_ENT1 = n_distinct(ID))
+
+# average number of body parts per whales per season
+a <- score_best_df %>% 
+  group_by(ID, Year) %>% 
+  summarize(nb_body_parts = n_distinct(Body_part))
+mean(a$nb_body_parts)
+sd(a$nb_body_parts)
+
+# average number of body parts per whales per season, not combining left and right
+a <- score_best_byside_df %>% 
+  group_by(ID, Year) %>% 
+  summarize(nb_body_parts = n_distinct(Body_part_side))
+mean(a$nb_body_parts)
+sd(a$nb_body_parts)
+
+# average number of body parts per whales per season of quality 1
+a <- score_best_df %>%
+  filter(Quality == "QUA1") %>% 
+  group_by(ID, Year) %>% 
+  summarize(nb_body_parts = n_distinct(Body_part))
+mean(a$nb_body_parts)
+sd(a$nb_body_parts)
+
+# and considering left and right
+a <- score_best_byside_df %>%
+  filter(Quality == "QUA1") %>% 
+  group_by(ID, Year) %>% 
+  summarize(nb_body_parts = n_distinct(Body_part_side))
+mean(a$nb_body_parts)
+sd(a$nb_body_parts)
+
+# total number of body parts photographed
+score_best_df %>% 
+  group_by(Body_part) %>% 
+  summarize(nb_photos= n())
+
+# how many males and females
+score_bestid_df %>% 
+  group_by(ID) %>% 
+  summarize(Sex = Sex[1]) %>% 
+  group_by(Sex) %>%
+  summarize(n = n())
+
+# percent photos collected after 2016
+score_best_df %>% 
+  mutate(cut2016 = ifelse(as.numeric(as.character(Year)) >= 2016, "post", "prior")) %>% 
+  group_by(cut2016) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) 
+
+# annual cases of raw scars
+score_best_df %>% 
+  filter(Fresh == 1) %>% 
+  summarize(ind = n_distinct(ID))
+
+# overall number of ind with most likely entang (all body parts combined)
+score_bestid_df %>% 
+  filter(Entang_num == 1) %>% 
+  summarize(nb_ID = n_distinct(ID)) %>% 
+  pull(nb_ID)
+
+# overall number of ind with most likely or likely entang (all body parts combined)
+score_bestid_df %>% 
+  filter(Entang_num <= 2) %>% 
+  summarize(nb_ID = n_distinct(ID)) %>% 
+  pull(nb_ID)
+```
+
+## Table of sample size per quality and photo type
+
+```{r}
+quality_wall <- score_best_df %>% 
+  group_by(Body_part, Quality, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  mutate(nb = paste0(percent, " (",n,")")) %>% 
+  select(-c(n, percent)) %>% 
+  pivot_wider(names_from = Quality, values_from = nb) %>% 
+  rename("Photo type" = "Body_part")
+
+quality_robbins <- perp_best_df %>% 
+  mutate(Quality = paste0("QUA", Quality_num)) %>% 
+  group_by(Quality, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  mutate(nb = paste0(percent, " (",n,")")) %>% 
+  select(-c(n, percent)) %>% 
+  pivot_wider(names_from = Quality, values_from = nb) %>% 
+  mutate(`Photo type` = "Perpendicular/Forward T.") %>% 
+  select(`Photo type`, everything())
+
+quality_df <- rbind(quality_wall, quality_robbins) %>% 
+  mutate(`Photo type` = factor(`Photo type`, levels = c('Fluke', 'Dorsal T.', 'Ventral T.', 'Perpendicular T.', 'Forward T.', 'Perpendicular/Forward T.'))) %>% 
+  rename("Quality 1" = "QUA1", "Quality 2" = "QUA2", "Quality 3" = "QUA3")
+  
+ft2 <- quality_df %>% 
+  flextable() %>% 
+  theme_vanilla() %>% 
+  align(align = "center", part = "all") %>% 
+  align_text_col(align = "left") %>% 
+  fontsize(part = "body", size = 11) %>% 
+  fontsize(part = "header", size = 12)
+ft2
+
+ft2 %>% save_as_docx(path = "./Outputs/Table2.docx")
+
+## associated x2 test
+# convert format to apply chisq test on frequencies
+tt <- table(score_best_df$Body_part, score_best_df$Quality, dnn = c("Body part", "Quality"))
+tt
+
+######### Chisq test of independence
+## Ordinal Chi-square test using permutations (coin library)
+coin::chisq_test(tt, scores = list("Quality" = c(-1, 0, 1)))
+# post-hoc
+PT <- rcompanion::pairwiseOrdinalIndependence(tt, compare = "row", method = "bonferroni")
+PT
+
+# average percent of quality 1 across photo types of wall et al
+score_best_df %>% 
+  group_by(Body_part, Quality, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  select(-c(n)) %>% 
+  filter(Quality == "QUA1") %>% 
+  pull(percent) %>% mean()
+```
+
+## Table of scarring prevalence per approach
+
+```{r}
+df_wall <- score_bestid_df %>% 
+  mutate(Body_part = factor(Body_part, levels = c('Fluke', 'Dorsal T.', 'Ventral T.', 'Perpendicular T.', 'Forward T.'))) %>% 
+  group_by(Body_part, Entang, .drop = FALSE) %>% 
+  mutate(Entang = car::recode(as.character(Entang), "'ENT1-Most likely' = 'Most likely'; 'ENT2-Likely' = 'Likely'; 'ENT4-Unlikely' = 'Unlikely' ;'ENT3-Possibly' = 'Possibly'", as.numeric = F)) %>% 
+  mutate(Entang = factor(Entang, levels = c("Most likely", "Likely", "Possibly", "Unlikely"))) %>%
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  mutate(nb = paste0(percent, " (",n,")")) %>% 
+  select(-c(n, percent)) %>% 
+  pivot_wider(names_from = Entang, values_from = nb) %>% 
+  rename("Photo type" = "Body_part")
+
+df_robbins <- perp_bestid_df %>% 
+  group_by(Perp_Entang, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  mutate(nb = paste0(percent, " (",n,")")) %>% 
+  select(-c(n, percent)) %>% 
+  pivot_wider(names_from = Perp_Entang, values_from = nb) %>% 
+  mutate(`Photo type` = "Perpendicular/Forward T.") %>% 
+  select(`Photo type`, everything())
+
+ft3a <- df_wall %>% 
+  flextable() %>% 
+  add_header_row(values = c("", "Likelihood of prior entanglement"), colwidths = c(1, 4)) %>%
+  theme_vanilla() %>% 
+  align(align = "center", part = "all") %>% 
+  align_text_col(align = "left") %>% 
+  fontsize(part = "body", size = 11) %>% 
+  fontsize(part = "header", size = 12)
+ft3a
+
+ft3a %>% save_as_docx( path = "./Outputs/Table3a.docx")
+
+ft3b <- df_robbins %>% 
+  flextable() %>% 
+  theme_vanilla() %>% 
+  align(align = "center", part = "all") %>% 
+  align_text_col(align = "left") %>% 
+  fontsize(part = "body", size = 11) %>% 
+  fontsize(part = "header", size = 12)
+ft3b
+
+ft3b %>% save_as_docx( path = "./Outputs/Table3b.docx")
+```
+
+
+## Main indicators of scarring prevalence
+
+### Wall et al. Most likely + likely proportion
+
+The percent of individuals showing “Most likely” and “Likely” entanglement scars in either of the five possible photo types is presented following the Wall et al. (2019) approach. 
+
+```{r}
+tot_wall_df <- score_bestid_df %>% 
+  group_by(ID) %>% 
+  summarize(Entang_num = min(Entang_num))
+  
+# number of individuals considered
+(Ntot_wall <- nrow(tot_wall_df))
+
+# number of individuals with at least one body part showing “Most likely” and “Likely” entanglement scars
+Ent_wall <- tot_wall_df %>% filter(Entang_num <= 2)
+(Nent_wall <- nrow(Ent_wall))
+
+# proportion of individuals with at least one body part showing “Most likely” and “Likely”
+(Pwall <- Nent_wall / Ntot_wall)
+```
+
+### Robbins & Mattila approach E4 and E3 proportion
+
+The percent of individuals showing E4 and E3 status in either their perpendicular or forward tailstock photos is presented following the Robbins & Mattila (2001) approach. 
+
+```{r}
+tot_robbins_df <- perp_bestid_df %>% 
+  group_by(ID) %>% 
+  summarize(Entang_num = min(Perp_Entang_num))
+  
+# number of individuals considered
+(Ntot_rob <- nrow(tot_robbins_df))
+
+# number of individuals with at least one body part showing “Most likely” and “Likely” entanglement scars
+Ent_rob <- tot_robbins_df %>% filter(Entang_num <= 2)
+(Nent_rob <- nrow(Ent_rob))
+
+# proportion of individuals with at least one body part showing “Most likely” and “Likely”
+(Prob <- Nent_rob / Ntot_rob)
+```
+
+### Added value of analyzing fluke photos
+
+To investigate the added value of analyzing fluke photos compared to the typical perpendicular tailstock photos used by Robbins & Mattila (2001), we further report the number of individuals whose fluke photos were assigned a “Most likely” or “Likely” category while their perpendicular, and forward tailstock photos were either unavailable or assigned “Possible” or “Unlikely” categories.
+
+```{r}
+# for each individual in the dataset
+flukedetections <- ddply(score_bestid_df, .(ID), function(d){
+  # if there is a fluke photo and it shows a score >= Likely
+  if(nrow(d[d$Entang_num <= 2 & d$Body_part %in% c("Fluke"), ]) > 0 ){
+    # and if none of the other body parts showed a score >= Likely
+    if(nrow(d[d$Entang_num <= 2 & d$Body_part %in% c("Perpendicular T.", "Forward T.", "Dorsal T.", "Ventral T."), ]) == 0){
+    # then return the reference of this fluke photo
+      return(d[(d$Entang_num <= 2 & d$Body_part %in% c("Fluke")), ])
+    }
+  }
+})
+
+# number of individuals whose likely or most likely score was detected only based on the fluke photo
+n_distinct(flukedetections$ID)
+# compare this number to the number of individuals identified as >= likely with all body parts
+n_distinct(flukedetections$ID) * 100 / Nent_wall
+```
+
+But flukes also often show false negatives...
+```{r}
+# Most likely scores detected via any body part but fluke and for which fluke was unlikely/possibly
+mostlikely_indnoflukes <- ddply(score_bestid_df, .(ID), function(d){
+  if(nrow(d[d$Entang_num == 1 & d$Body_part %in% c("Perpendicular T.", "Forward T.", "Dorsal T.", "Ventral T."), ]) > 0){
+    if(nrow(d[d$Entang_num <= 2 & d$Body_part %in% c("Fluke"), ]) == 0 ){
+      return(d[d$Body_part %in% c("Fluke"), ])
+    }
+  }
+})
+
+# number of individuals with at least one body part showing “Most likely” entanglement scars
+Ent_most_wall <- tot_wall_df %>% filter(Entang_num == 1)
+(Nent_most_wall <- nrow(Ent_most_wall))
+
+# number of individuals classified as most likely based on anything but fluke
+n_distinct(mostlikely_indnoflukes$ID)
+# percent of most likely individuals who were discovered to be entangled on anything but fluke
+n_distinct(mostlikely_indnoflukes$ID) * 100 / Nent_most_wall
+
+# example for figure S5
+score_bestid_df %>% filter(ID == "CRC12174")
+```
+
+Proportion of fluke photos where 90% of the leading edge of the fluke is visible
+```{r}
+# this considerably affects the capacity to detect scarring on the leading edge
+score_df %>% 
+  filter(Body_part == "Fluke") %>% 
+  group_by(Fluke_abovewater) %>% 
+  summarize(nb_photos = n()) %>% 
+  mutate(percent = round(nb_photos / sum(nb_photos)*100, 1)) 
+```
+
+### Shigh - Slow
+
+The highest and lowest estimates of scarring prevalence (Shigh - Slow) was highlighted among these different estimates.
+```{r}
+(Slow <- min(Prob, Pwall))
+(Shigh <- max(Prob, Pwall))
+```
+
+# Spatio-temporal effects analysis
+
+## Map
+
+```{r}
+score_sf <- score_best_df %>% 
+  group_by(ID) %>% 
+  summarize(Entang_num = min(Entang_num),
+            lat = mean(lat, na.rm = T),
+            lon = mean(lon, na.rm = T)) %>% 
+  mutate(Entang = car::recode(as.character(Entang_num), "'1' = 'Most likely'; '2' = 'Likely' ;'3' = 'Possibly'; '4' = 'Unlikely'", as.numeric = F)) %>% 
+  mutate(Entang = factor(Entang, levels = c("Most likely", "Likely", "Possibly", "Unlikely"))) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = 32610) %>% 
+  arrange(-Entang_num)
+
+g <- ggplot() +
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey80", size = 0.05) +
+    geom_sf(data = coast_sf, col = NA, fill = "grey15") +
+    geom_sf_text(data = places, aes(label = name), nudge_x = 0, size = 2.8, col = "grey50") +
+    mon_theme +
+    xlab("") +
+    ylab("") +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+        axis.text.x = element_text(hjust = 0.9),
+          panel.grid = element_blank(),
+          legend.position = "bottom",
+          text=element_text(face="bold", size=7),
+          legend.key.size = unit(0.8, "lines"),
+                panel.spacing = unit(0.5, "lines"),
+                plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) +
+    geom_sf(data = score_sf, aes(color = Entang), alpha = 0.8) +
+    coord_sf(xlim = c(307857.5, 5e+05), ylim = c(4649776, 5129996), expand = F) +
+    scale_color_manual(name = "Probability of \nprior entanglement",
+                    values = pal_wall) +
+  guides(color=guide_legend(nrow=2, byrow=TRUE)) 
+g
+ggsave(g, file = "./Outputs/Fig2.png", width = 90, height = 200, units = "mm", dpi = 600)
+```
+
+## Scar scores through time
+
+Number of photos per photo type per year
+```{r}
+g <- ggplot(score_best_df, aes(as.factor(Year), fill = Body_part, color = Body_part)) + 
+  geom_bar() +
+  scale_fill_grey(name = "Photo types") +
+  scale_color_grey(name = "Photo types") +
+  mon_theme +
+  xlab("Year") +
+  ylab("#Photos")
+g
+
+ggsave(g, file = "./Outputs/FigS4.png", width = 180, height = 80, units = "mm", dpi = 600)
+# sample size in this plot
+nrow(score_best_df)
+n_distinct(score_best_df$ID)
+```
+
+Scarring prevalence per year per approach
+```{r}
+### Wall scores
+# scores per year per body part
+wall_year <- score_best_df %>% 
+  mutate(Entang = car::recode(as.character(Entang), "'ENT1-Most likely' = 'Most likely'; 'ENT2-Likely' = 'Likely'; 'ENT4-Unlikely' = 'Unlikely' ;'ENT3-Possibly' = 'Possibly'", as.numeric = F)) %>% 
+  mutate(Entang = factor(Entang, levels = c("Most likely", "Likely", "Possibly", "Unlikely"))) %>% 
+  mutate(Body_part = factor(Body_part, levels = c('Fluke', 'Dorsal T.', 'Ventral T.', 'Perpendicular T.', 'Forward T.'))) %>% 
+  filter(as.numeric(Year) >= 2016 & Year != "2021") %>% 
+  group_by(Body_part, Year, Entang, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 0)) %>% 
+  arrange(Body_part, Year, Entang)
+
+# sample size per year
+wall_year_n <- score_best_df %>% 
+  filter(as.numeric(Year) >= 2016 & Year != "2021") %>% 
+  mutate(Body_part = factor(Body_part, levels = c('Fluke', 'Dorsal T.', 'Ventral T.', 'Perpendicular T.', 'Forward T.'))) %>% 
+  group_by(Body_part, Year) %>% 
+  summarize(n = n()) %>% 
+  mutate(Entang = "Most likely") # dummy variable
+
+### Robbins et al scores
+# scores per year
+robbins_year <- perp_best_df %>% 
+  group_by(Year, Perp_Entang, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 0)) %>% 
+  arrange(Year, Perp_Entang) %>% 
+  mutate(Body_part = "Perpendicular/Forward T.")
+
+# sample size per year
+robbins_year_n <- perp_best_df %>% 
+  mutate(Body_part = "Perpendicular/Forward T.") %>% 
+  group_by(Year) %>% 
+  summarize(n = n()) %>% 
+  mutate(Perp_Entang = "E4") # dummy variable
+
+### combine plots
+g1 <- ggplot(wall_year, 
+            aes(x=Year, y=percent, fill=Entang)) +
+  geom_bar(stat="identity", alpha = 0.8) +
+  geom_text(data = wall_year_n, aes(x = Year, y=108, label = n, size = 2.2), col = "grey9", size = 1.8) +
+  scale_fill_manual(name = "Probability of \nprior entanglement",
+                    values =  pal_wall) +
+  facet_wrap(~Body_part, ncol = 1) +
+  mon_theme +
+  ylab("Proportion of individuals (%)") +
+  xlab("Year") &
+  scale_y_continuous(expand = c(0,0), 
+                     breaks = c(25, 50, 75, 100), limits = c(0, 115)) &
+  theme(legend.key.size = unit(0.4, "cm"),
+        legend.title = element_text(size = 8))
+
+g2 <- ggplot(robbins_year, 
+            aes(x=Year, y=percent, fill=Perp_Entang)) +
+  geom_bar(stat="identity", alpha = 0.8) +
+  geom_text(data = robbins_year_n, aes(x = Year, y=108, label = n), col = "grey9", size = 1.8) + 
+  scale_fill_manual(name = "Probability of \nprior entanglement",
+                    values = pal_robbins) +
+  facet_wrap(~Body_part) +
+  mon_theme +
+  ylab("") +
+  xlab("Year") &
+  scale_y_continuous(expand = c(0,0), 
+                     breaks = c(25, 50, 75, 100), limits = c(0, 115)) &
+  theme(legend.key.size = unit(0.4, "cm"),
+        legend.title = element_text(size = 8))
+
+ggsave(g1, file = "./Outputs/Fig3a.png", width = 120, height = 167, units = "mm", dpi = 600)
+ggsave(g2, file = "./Outputs/Fig3b.png", width = 120, height = 33, units = "mm", dpi = 600)
+```
+
+## Spatio-temporal model
+
+```{r}
+# put together a dataframe of scores per individual per year > 2016
+spatiotemp_gam_df <- score_best_df %>% 
+  filter(Year >= 2016) %>%
+  mutate(w = ifelse(Entang_num >= 3, 4-Quality_num, 3)) %>% 
+  mutate(w = w / mean(w)) %>% 
+  mutate(ID = as.factor(ID),
+         Year = as.numeric(Year),
+         Body_part = as.factor(Body_part)) %>% 
+  mutate(Entang_likelihood = as.numeric(car::recode(as.character(Entang_num), "'4' = '1'; '3'='2';'2'='3';'1'='4'")))
+
+# run gam with ocat family
+m_spatiotemp <- gam(Entang_likelihood ~ s(Year, k = 3) + 
+                     s(lat, k = 3) +
+                     Body_part,
+                   data = spatiotemp_gam_df,
+                   weights = w,
+                   method = "REML", 
+                   select = T, 
+                   family = ocat(R = 4))
+
+# show significance of smooth terms and deviance explained
+summary(m_spatiotemp)
+
+# compare to model without photo-type to assess % deviance explained by that variable
+m_null <- gam(Entang_likelihood ~ s(Year, k = 3) + 
+                     s(lat, k = 3),
+                   data = spatiotemp_gam_df,
+                   weights = w,
+                   method = "REML", 
+                   select = T, 
+                   family = ocat(R = 4))
+summary(m_null)
+```
+
+Supplementary figure
+```{r}
+png(file = "./Outputs/FigS7.png", width = 180, height = 180, units = "mm", res = 600)
+layout(matrix(c(1, 3, 2, 3), nrow = 2))
+plot(m_spatiotemp, select = 1, ylab = "Likelihood of prior entanglement", xlab = "Year")
+plot(m_spatiotemp, select = 2, ylab = "Likelihood of prior entanglement", xlab = "Latitude")
+plot(m_spatiotemp, select = 3, ylab = "Likelihood of prior entanglement", xlab = "Photo type", all.terms = T)
+layout(1)
+dev.off()
+```
+
+# Sex effect analysis
+
+```{r}
+# put together a dataframe of scores per individual across years
+sex_df <- score_best_df %>% 
+  group_by(ID) %>% #across years and body_parts
+  summarize(Entang_num = min(Entang_num),
+            Sex = Sex[1]) %>% 
+  filter(!is.na(Sex)) %>% 
+  mutate(Sex = as.factor(Sex)) %>% 
+  mutate(Entang = car::recode(as.character(Entang_num), "'1' = 'Most likely'; '2' = 'Likely' ;'3' = 'Possibly'; '4' = 'Unlikely'", as.numeric = F)) %>% 
+  mutate(Entang = factor(Entang, levels = c("Most likely", "Likely", "Possibly", "Unlikely"))) %>% 
+  group_by(Sex, Entang, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 0)) %>% 
+  arrange(Sex, Entang) %>% 
+  ungroup() %>% 
+  mutate(nlab = c(98, 94, 75, 30, 92, 74.5, 52, 19.5))
+sex_df
+
+g <- ggplot(sex_df, 
+            aes(x=Sex, y=percent, fill=Entang)) +
+  geom_bar(stat="identity", alpha = 0.8) +
+  geom_text(data = sex_df, aes(x = Sex, y = nlab, label = n), 
+            col = "grey20", size = 1.8) +
+  scale_fill_manual(name = "Probability of \nprior entanglement",
+                    values =  pal_wall) +
+  mon_theme +
+  ylab("Proportion of individuals (%)") +
+  xlab("Sex") &
+  scale_y_continuous(expand = c(0,0), 
+                     breaks = c(25, 50, 75, 100), limits = c(0, 100)) &
+  theme(legend.key.size = unit(0.4, "cm"),
+        legend.title = element_text(size = 8))
+g
+ggsave(g, file =  "./Outputs/Fig4.png", width = 90, height = 90, units = "mm", dpi = 600)
+```
+
+
+```{r}
+# put together a dataframe of scores per individual with identified sex
+sex_clm_df <- score_best_df %>% 
+  group_by(ID) %>%
+  arrange(Entang_num, .by_group = T) %>% 
+  slice_head(n = 1) %>% 
+  ungroup() %>%
+  mutate(w = ifelse(Entang_num <= 2, 4-Quality_num, 3)) %>% 
+  mutate(w = w / mean(w)) %>% 
+  filter(!is.na(Sex)) %>% 
+  mutate(Sex = as.factor(Sex),
+         Entang_num = as.factor(Entang_num))
+
+# ru cumulative link model
+m_sex <- clm(Entang_num ~ Sex + Body_part, 
+                      weights = w, 
+                      data = sex_clm_df)
+
+# assess effect of sex on categorical probability of prior entanglement
+car::Anova(m_sex, type = "II")
+summary(m_sex)
+```
+
+# Simulation
+
+## Set parameters and scenarios
+```{r}
+#################################
+### Scarring rate ###############
+base_proportions <- perp_bestid_df %>% 
+  group_by(Perp_Entang, .drop = FALSE) %>% 
+  summarize(n = n()) %>% 
+  mutate(percent = round(n / sum(n)*100, 1)) %>% 
+  select(-c(n))
+
+# prevalence of scars in the pop (based on Robbins et al scoring approach)
+# between 2016 and 2023 - minimum Perp estimate for E4 and E3
+base_ent <- base_proportions[base_proportions$Perp_Entang %in% c("E4"), ]$percent/100 +
+  base_proportions[base_proportions$Perp_Entang %in% c("E3"), ]$percent/100 
+
+# baseline sample of the population entanglement status 
+dref <- perp_bestid_df %>% 
+  mutate(response = ifelse(Perp_Entang %in% c("E3", "E4"), 1, 0),
+         year = "2023") %>% 
+  select(response, year)
+
+#################################
+### Resight rate parameter ######
+# include a term for annual resighting rate
+# reloading score_df that includes QUA4 photos for calculating resights
+load("./Inputs/score_df.RData")
+hb_or_df <- score_df %>% 
+  filter(Body_part == "Fluke underside") %>% 
+  filter(lat >= 41.9 & lat <= 46.3) %>% 
+  dplyr::select(ID, Date, Year) %>% 
+  # remove within season resights
+  ddply(., .(ID, Year), function(d){d[1,]})
+
+# number of sightings of photo-identified whales
+a <- hb_or_df %>% 
+  filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% nrow()
+# number of unique IDs that were photo identified
+b <- hb_or_df %>% 
+  filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
+  summarize(unique_photoID = n_distinct(ID)) %>% 
+  pull(unique_photoID)
+
+# resighting rate
+resight_rate <- 100 - b * 100 / a
+resight_rate
+
+####################################
+### Set scenarios and conditions ###
+
+scenarios_df <- tibble(sce_num = c(1:12),
+       sce_ent = rep(c(rep("End abruptly", 3), rep("Continue at low prevalence", 3)), 2),
+       sce_pop = rep(rep(c("Rapid growth", "Slow growth", "Carrying capacity"), 2), 2),
+       pop_start_size = 1284 + 3185, # as per Caretta et al. 2023 - Curtis et al 2022 and Calambokidis & Barlow 2020
+       pop_trend = rep(c(1.082, 1.041, 1), 4), # 0.082 is Calambokidis & Barlow 2020 estimate for california current whales. 8.2 % annually since 1989
+       sce_surv = c(rep("Survival 0.95", 6), rep("Survival 0.97", 6)),
+       survival = c(rep(0.95, 6), rep(0.97, 6)),
+       pop_ref = list(dref),
+       resight_rate = resight_rate,
+       scar_rate = base_ent) %>% 
+  mutate(sce_ent = factor(sce_ent, levels = c("End abruptly", "Continue at low prevalence")),
+         sce_pop = factor(sce_pop, levels = c("Rapid growth", "Slow growth", "Carrying capacity")))
+       
+scenarios_df
+```
+
+```{r, eval = F}
+##########################
+##### Pop simulation  ####
+
+# repeat the simulations three times, for the three different time period that are going to be tested: 2, 5 or 10 years after the change in entanglement rates
+scenarios_df <- rbind(scenarios_df, scenarios_df, scenarios_df) %>% 
+  mutate(period = rep(c(2, 5, 10), each = nrow(scenarios_df)))
+
+## simulating yearly proportion of scarred whales considering pop trend
+scenarios_df <- scenarios_df %>% 
+  mutate(pop_simu = pmap(list(pop_start_size, pop_trend, scar_rate, sce_ent, sce_pop, pop_ref, survival, period), function(pop_start_size, pop_trend, scar_rate, sce_ent, sce_pop, pop_ref, survival, period){
+    simu_df <- tibble(year = seq(2023,2023+period, 1), # if 2023 was the start date of the simulation, up to 2040
+           pop_size = pop_start_size,
+           nb_ent = round(pop_start_size * scar_rate, 0)) # nb of ind showing E3 and E4 scars when the starting pop size
+   pop_of_year <- c(rep(0, pop_start_size - round(pop_start_size * scar_rate, 0)), 
+                    rep(1, round(pop_start_size * scar_rate, 0)))
+    for (i in c(2:(period + 1))){
+      ## a small portion of the population dies every year
+      # randomly remove a % of the pop
+      # nb of ind dying
+      nb_dead <- floor((1-survival)*length(pop_of_year))
+      pop_of_year <- pop_of_year[sample(c(1:length(pop_of_year)),
+                            length(pop_of_year) - nb_dead, replace = F)]
+      ## population grows every year, unless it is considered to be at carrying capacity (pop_trend = 1 in that case and the pop_size remains constant)
+      # for every year, calculated pop size based on pop_trend and pop scenario
+        simu_df$pop_size[i] <- round(simu_df$pop_size[i-1] 
+                               - (1-survival)*simu_df$pop_size[i-1] 
+                               + (log(pop_trend) + (1-survival))*simu_df$pop_size[i-1], 0)
+
+      # for every year, calculated number of scarred individuals, considering assumptions on new entanglements occurring
+      if(sce_ent == "End abruptly"){
+        # no more entanglements so we complete the vector with as many zeros as they are new individuals in the population plus those that died and were "replaced"
+        pop_of_year <- c(pop_of_year, rep(0, 
+                        nb_dead + (simu_df$pop_size[i]-simu_df$pop_size[i-1])))
+        simu_df$nb_ent[i] <- length(pop_of_year[pop_of_year == 1]) # E4 and E3 scars do not fade but no more entanglements occur, a portion of the pop dies and is replaced by new individuals who are exempt from scars
+      }
+      if(sce_ent == "Continue at low prevalence"){
+        # E4 and E3 scars do not fade but 5% of the pop keeps getting entangled every year    
+        # fill with zeros the new whales
+        pop_of_year <- c(pop_of_year, rep(0, 
+                        nb_dead + (simu_df$pop_size[i]-simu_df$pop_size[i-1])))
+        # but then randomly reentangle 5 % (and animals already showing scars can have new scars)
+        new_entang <- sample(c(1:length(pop_of_year)), floor(0.05 * length(pop_of_year)), replace = F)
+        pop_of_year[new_entang] <- 1
+        simu_df$nb_ent[i] <- length(pop_of_year[pop_of_year == 1])
+      }
+    }
+
+    simu_df <- simu_df %>% 
+        # calculate percent of whales with scars per year
+        mutate(prop_scar = nb_ent / pop_size)
+  }))
+
+# plot trends
+pop_simu_df <- scenarios_df %>% 
+  unnest(cols = pop_simu)
+
+g_popsimu <- ggplot(subset(pop_simu_df, sce_ent == "End abruptly"), aes(x = year)) +
+    geom_line(aes(y = pop_size), color = "grey30") +
+    geom_line(aes(y = prop_scar*17000), color = "#0686BB", linetype = "21") +
+    scale_linetype(name = "Entanglement scenario") +
+    facet_grid(sce_surv~sce_pop) +
+    scale_x_continuous(breaks = seq(2023,2040, 2),
+                       labels = seq(2023,2040, 2) - 2023) +
+    scale_y_continuous(name = "Population size",
+      sec.axis = sec_axis(~./17000*100, breaks = seq(20, 100, 20), 
+                        name = "Scarring rate (%)")) +
+    mon_theme +
+    theme(
+      #axis.text.x = element_text(angle = 45, vjust = 0.4),
+      axis.title.y = element_text(color = "grey30"),
+      axis.title.y.right = element_text(color = "#0686BB"),
+      axis.text.y.right = element_text(color = "#0686BB"),
+      legend.position = "bottom")
+g_popsimu
+ggsave(g_popsimu, file = "./Outputs/FigS3.png", width = 180, height = 140, units = "mm", dpi = 600)
+
+###########################
+### Sampling simulation ###
+
+# let's admit that every year we sample from 5 to 250 individuals from the population
+# based on max sample from 2018
+
+scenarios_df <- scenarios_df %>% 
+  mutate(pop_simu = pmap(list(pop_simu), function(pop_simu){
+  tibble(sample_size = seq(5, 250, 5)) %>% 
+    mutate(run_samples = map(sample_size, function(s){
+      tibble(runs = c(1:1000)) %>% 
+        mutate(run_iterations = map(runs, function(i){
+          pop_simu %>% 
+            mutate(binsample = pmap(list(w = nb_ent, x = pop_size, y = year), function(w, x, y){
+              sample(c(rep(0, x - w), rep(1, w)), s, replace = FALSE)
+            }))
+        }))
+    })) %>% 
+    unnest(cols = run_samples) %>% 
+    unnest(cols = run_iterations)
+  }))
+
+save(scenarios_df, file = "./Outputs/scenarios_df.RData")
+```
+
+ 
+## Power analysis
+
+```{r, warning = F, message = F, eval = F}
+load("./Outputs/scenarios_df.RData")
+
+#######################
+### Power analysis ####
+
+# cumulated samples from every year, remove resighted ind and compare to baseline reference to detect a change in scar prevalence
+power_df <- scenarios_df %>% 
+  mutate(power = pmap(list(pop_simu, resight_rate, pop_ref, period), 
+                      function(pop_simu, resight_rate, pop_ref, period){
+    ddply(pop_simu, .(sample_size, runs), function(d){
+      d$sig <- NA
+      # select all samples from 2024 up to year y
+      cum_sample <- d %>% 
+        slice(1:(period+1)) %>% 
+        unnest(binsample)
+      # remove a chunk of it already seen in prior years
+      # number of individuals to keep (removing resights)
+      nbkeep <- round((100-resight_rate) * nrow(cum_sample)/100, 0)
+      # only keep these in the cumulative sample
+      cum_sample <- cum_sample %>% 
+          slice_sample(n = nbkeep, replace = F)
+
+      # put pop_ref and cum_sample under the same format and rbind them
+      dd <- cum_sample %>% 
+        mutate(response = binsample) %>% 
+        select(response, year)
+      
+      # run linear regression and extract p-value and year coefficiant
+      m <- glm(response ~ year, data = dd, family = binomial(link = "logit"))
+      d$sig[[period + 1]] <- tidy(m)$p.value[2] <= .05
+      d$est[period + 1] <- tidy(m)$estimate[2]
+    return(d[c(1, (period + 1)), ])
+  })
+}))
+
+# calculated number of runs in which a significant change in scarring rate was detected
+power_sum_df <- power_df %>% 
+  mutate(power_sum = map(power, function(d){
+    d %>% 
+      filter(!is.na(sig)) %>% 
+      mutate(sample_size = as.factor(sample_size),
+         period = year - 2023,
+         year = as.factor(year)) %>% 
+      group_by(sample_size, period, .drop = FALSE) %>% 
+      summarize(power_level = mean(sig, na.rm = T)*100,
+                power_se = sd(sig, na.rm = T)/sqrt(100),
+                estimate_coeff = mean(est, na.rm = T)) %>% 
+      mutate(power90 = ifelse(power_level >= 90, 1, 0),
+             power80 = ifelse(power_level >= 80, 1, 0))
+  }))
+
+save(power_sum_df, file = "./Outputs/power_sum_df.RData")
+```
+
+```{r}
+load("./Outputs/power_sum_df.RData")
+
+# extract the year at which 80 % power was reached for 30, 100 and 200 samples per year
+ltb <- power_sum_df %>% 
+  select(-period) %>% 
+  unnest(cols = power_sum) %>% 
+  filter(power80 == 1) %>% 
+  group_by(sce_ent, sce_surv, sce_pop, period) %>% 
+  arrange(power_level, sample_size, .by_group = T) %>% 
+  slice_head(n = 1) %>% 
+  ungroup() %>% 
+  mutate(period = as.factor(period))
+
+# unnest the power analysis data to produce a plot
+ptb <- power_sum_df %>%
+  select(-period) %>% 
+  unnest(cols = power_sum) %>%
+  arrange(sce_ent, sce_surv, sce_pop, sample_size)%>% 
+  mutate(period = as.factor(period))
+
+rm(power_sum_df)
+
+# graphical representation with sample size as x axis
+# focus on scenario where entanglement equal zero at start of the simulation
+g <- ggplot() +
+  geom_line(data = subset(ptb, sce_ent == "End abruptly"), 
+            aes(sample_size, power_level, 
+                group = period, 
+                color = period), linewidth = 0.5) +
+  geom_segment(data = subset(ltb, sce_ent == "End abruptly"), 
+               aes(x = sample_size, xend = sample_size, 
+               y = -5, yend = power_level, 
+               color = period), 
+               linetype = "21", alpha = 1, linewidth = 0.4) +
+  geom_segment(data = subset(ltb, sce_ent == "End abruptly"), 
+               aes(x = 0, xend = sample_size, 
+               y = power_level, yend = power_level, 
+               color = period), 
+               linetype = "21", alpha = 1, linewidth = 0.4) +
+  theme_light() +
+  mon_theme +
+  facet_grid(sce_surv ~ sce_pop) +
+  scale_x_discrete(name = "#Individuals photographed per year",
+                   breaks = seq(0, 250, 20)) +
+  scale_y_continuous("Power", limits = c(-5, 105),
+                     breaks = c(0, 20, 40, 60, 80, 100),
+                     labels = paste(c(0, 20, 40, 60, 80, 100), "%"),
+                     expand = c(0,0)) +
+  scale_color_manual(name = "Years of \nmonitoring", values = c("grey85", "grey40", "black")) +
+  theme(axis.text.x = element_text(size = 4))
+
+ggsave(g, file = "./Outputs/Fig5.png", width = 180, height = 110, units = "mm", dpi = 600)
+g
+```
+
