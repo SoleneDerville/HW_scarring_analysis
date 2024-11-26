@@ -810,6 +810,31 @@ car::Anova(m_sex, type = "II")
 summary(m_sex)
 ```
 
+```{r}
+# additional analysis of sex effect using the Robbins & Mattila approach
+sex_perp_clm_df <- perp_best_df %>% 
+  group_by(ID) %>%
+  arrange(Perp_Entang_num, .by_group = T) %>% 
+  slice_head(n = 1) %>% 
+  ungroup() %>%
+  mutate(w = ifelse(Perp_Entang_num <= 2, 4-Quality_num, 3)) %>% 
+  mutate(w = w / mean(w)) %>% 
+  filter(!is.na(Sex)) %>% 
+  mutate(Sex = as.factor(Sex),
+         Perp_Entang_num = as.factor(Perp_Entang_num))
+
+# ru cumulative link model
+m_sex_perp <- clm(Perp_Entang_num ~ Sex, 
+                      weights = w,  
+                      data = sex_perp_clm_df)
+
+# check data
+table(sex_perp_clm_df$Sex, sex_perp_clm_df$Perp_Entang_num)
+# assess effect of sex on categorical probability of prior entanglement
+car::Anova(m_sex_perp, type = "II")
+summary(m_sex_perp)
+```
+
 # Simulation
 
 ## Set parameters and scenarios
