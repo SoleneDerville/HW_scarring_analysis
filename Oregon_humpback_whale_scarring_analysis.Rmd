@@ -32,12 +32,18 @@ coast_sf <- st_read("./Inputs/coast_openstreetmap_WA-OR-CA.shp")
 iso_sf <- st_read("./Inputs/isobaths_50mto1500m.shp")
 iso_sf_utm <- st_transform(iso_sf, crs = 32610)
 
+# 40 fathom fishing limit
+iso40_sf <- st_read("./Inputs/XY40fm_03152021_PointsToLine1.shp")
+iso40_sf_utm <- st_transform(iso_sf, crs = 32610)
+
 # places names
 places <- data.frame(name = c("Astoria", "Newport", "Charleston", "Brookings", "Garibaldi", "Cascade Head", "Bandon", "Winchester Bay", "Port Orford"),
                       lon = c(-123.65, -123.75,-123.97, -123.96, -123.59, -123.5, -124.15, -123.7, -124.11),
                       lat = c(46.1,  44.6, 43.3, 42.08, 45.55, 45.07, 43.12, 43.67, 42.76),
                      type = c(rep("cities", 5), rep("zones", 2), rep("cities", 2))) 
 places <- st_as_sf(places, coords = c("lon", "lat"), crs = 4326)
+
+
 ```
 
 Inset map
@@ -80,7 +86,9 @@ score_df <- score_df %>%
   mutate(Body_part_side = paste(Body_part, Side, sep = "_")) %>% 
   # change the factor levels to abbreviate photo types a.k.a Body_part
   mutate(Body_part = car::recode(Body_part, "'Ventral tailstock' = 'Ventral T.'; 'Perpendicular tailstock'='Perpendicular T.';'Forward tailstock'='Forward T.'; 'Dorsal tailstock'='Dorsal T.'; 'Fluke underside' = 'Fluke'", as.numeric = F)) %>% 
-  mutate(Entang = factor(Entang, levels = c("ENT1-Most likely", "ENT2-Likely","ENT3-Possibly","ENT4-Unlikely")))
+  mutate(Entang = factor(Entang, levels = c("ENT1-Most likely", "ENT2-Likely","ENT3-Possibly","ENT4-Unlikely"))) %>% 
+  filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN")))
+  
 ```
 
 ## Scores per individual per year
@@ -245,13 +253,19 @@ score_df %>%
                      str_subset(score_df$file, ".Josh"))) %>% 
   summarize(ind = n_distinct(ID))
 
+# individuals photographed by OSU, excluding fishermen photos
+score_df %>% 
+  filter(!(file %in% c(str_subset(score_df$file, ".CBarnhart"),
+                     str_subset(score_df$file, ".Josh"))) &
+             Source %in% c("SOURCE-GEMMLAB", "SOURCE-WHETLAB")) %>% 
+  summarize(ind = n_distinct(ID))
+
 # how many new cases of entang ind?
 d <- score_df %>% 
   filter(file %in% c(str_subset(score_df$file, ".CBarnhart"),
                      str_subset(score_df$file, ".Josh")),
          Entang == "ENT1-Most likely")
 score_df[score_df$ID %in% unique(d$ID),]
-
 
 # how many unique IDs in Wall et al. approach
 n_distinct(score_best_df$ID)
@@ -266,17 +280,6 @@ n_distinct(paste0(score_best_df$ID, score_best_df$Year))
 score_best_df %>% 
   filter(!(substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
   summarize(unique_photoID = n_distinct(ID))
-
-# percent of NI in unique IDs
-(score_best_df %>% 
-  filter((substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
-  summarize(unique_photoID = n_distinct(ID)) %>% pull(unique_photoID)) * 100 /
-  n_distinct(score_best_df$ID)
-# percent photos from NI
-(score_df %>% 
-  filter((substr(ID, 1, 4) %in% c("MNOR", "NIMN"))) %>% 
-  summarize(nbphotos = n()) %>% pull(nbphotos)) * 100 /
-  nrow(score_df)
 
 # how many real unique IDs identified with Most likely entang
 score_best_df %>% 
@@ -463,6 +466,59 @@ ft3b %>% save_as_docx( path = "./Outputs/Table3b.docx")
 
 ## Main indicators of scarring prevalence
 
+Function to calculate confidence interval on scarring prevalence estimates
+```{r}
+Fun_ConfInt <- function(p,n){
+  conf_low <- p - 1.96*sqrt((p * (100-p))/n)
+  conf_high <- p + 1.96*sqrt((p * (100-p))/n)
+  return(c(conf_low, conf_high))
+}
+```
+
+
+### Wall et al. Most likely proportion
+
+The percent of individuals showing “Most likely” entanglement scars in either of the five possible photo types is presented following the Wall et al. (2019) approach. 
+
+```{r}
+tot_wall_df <- score_bestid_df %>% 
+  group_by(ID) %>% 
+  summarize(Entang_num = min(Entang_num))
+  
+# number of individuals considered
+(Ntot_wall <- nrow(tot_wall_df))
+
+# number of individuals with at least one body part showing “Most likely” and “Likely” entanglement scars
+Ent_wallm <- tot_wall_df %>% filter(Entang_num <= 1)
+(Nent_wallm <- nrow(Ent_wallm))
+
+# proportion of individuals with at least one body part showing “Most likely” and “Likely”
+(Pwallm <- Nent_wallm / Ntot_wall*100)
+
+# confidence interval
+Fun_ConfInt(Pwallm, Ntot_wall)
+```
+Check that the results are similar if the Pwallm was calculated only with 2016-2023 data so as to cover the same time period as Prob
+```{r}
+tot_wall_df_2016 <- score_bestid_df %>% 
+  filter(as.numeric(Year) >= 2016) %>% 
+  group_by(ID) %>% 
+  summarize(Entang_num = min(Entang_num))
+  
+# number of individuals considered
+(Ntot_wall16 <- nrow(tot_wall_df_2016))
+
+# number of individuals with at least one body part showing “Most likely” and “Likely” entanglement scars
+Ent_wallm16 <- tot_wall_df_2016 %>% filter(Entang_num <= 1)
+(Nent_wallm16 <- nrow(Ent_wallm16))
+
+# proportion of individuals with at least one body part showing “Most likely” and “Likely”
+(Pwallm16 <- Nent_wallm16 / Ntot_wall16*100)
+
+# confidence interval
+Fun_ConfInt(Pwallm16, Ntot_wall16)
+```
+
 ### Wall et al. Most likely + likely proportion
 
 The percent of individuals showing “Most likely” and “Likely” entanglement scars in either of the five possible photo types is presented following the Wall et al. (2019) approach. 
@@ -480,7 +536,10 @@ Ent_wall <- tot_wall_df %>% filter(Entang_num <= 2)
 (Nent_wall <- nrow(Ent_wall))
 
 # proportion of individuals with at least one body part showing “Most likely” and “Likely”
-(Pwall <- Nent_wall / Ntot_wall)
+(Pwall <- Nent_wall / Ntot_wall*100)
+
+# confidence interval
+Fun_ConfInt(Pwall, Ntot_wall)
 ```
 
 ### Robbins & Mattila approach E4 and E3 proportion
@@ -500,8 +559,12 @@ Ent_rob <- tot_robbins_df %>% filter(Entang_num <= 2)
 (Nent_rob <- nrow(Ent_rob))
 
 # proportion of individuals with at least one body part showing “Most likely” and “Likely”
-(Prob <- Nent_rob / Ntot_rob)
+(Prob <- Nent_rob / Ntot_rob*100)
+
+# confidence interval
+Fun_ConfInt(Prob, Ntot_rob)
 ```
+
 
 ### Added value of analyzing fluke photos
 
@@ -524,6 +587,8 @@ flukedetections <- ddply(score_bestid_df, .(ID), function(d){
 n_distinct(flukedetections$ID)
 # compare this number to the number of individuals identified as >= likely with all body parts
 n_distinct(flukedetections$ID) * 100 / Nent_wall
+# did the whale have photos of other body parts or not?
+score_bestid_df %>% filter(ID %in% unique(flukedetections$ID))
 ```
 
 But flukes also often show false negatives...
@@ -564,8 +629,18 @@ score_df %>%
 
 The highest and lowest estimates of scarring prevalence (Shigh - Slow) was highlighted among these different estimates.
 ```{r}
-(Slow <- min(Prob, Pwall))
-(Shigh <- max(Prob, Pwall))
+(Slow <- min(Prob, Pwall, Pwallm))
+(Shigh <- max(Prob, Pwall, Pwallm))
+```
+Compare Shigh and Slow statistically with a Fisher exact test for count data
+```{r}
+(bin_prev <- rbind(c(Nent_rob, Ntot_rob-Nent_rob), c(Nent_wallm, Ntot_wall-Nent_wallm)))
+fisher.test(bin_prev)
+
+# check that results are the same if we focus on 2016-2023
+(bin_prev <- rbind(c(Nent_rob, Ntot_rob-Nent_rob), c(Nent_wallm16, Ntot_wall16-Nent_wallm16)))
+fisher.test(bin_prev)
+
 ```
 
 # Spatio-temporal effects analysis
@@ -585,9 +660,11 @@ score_sf <- score_best_df %>%
   arrange(-Entang_num)
 
 g <- ggplot() +
-    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey80", size = 0.05) +
-    geom_sf(data = coast_sf, col = NA, fill = "grey15") +
-    geom_sf_text(data = places, aes(label = name), nudge_x = 0, size = 2.8, col = "grey50") +
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey85", size = 0.01) +
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200), ], col = "grey60", size = 0.08) +
+    geom_sf(data = coast_sf, col = NA, fill = "grey60", size = 0.08) +
+    geom_sf(data = iso40_sf, col = "black") +
+    geom_sf_text(data = places, aes(label = name), nudge_x = 0, size = 2.8, col = "grey20") +
     mon_theme +
     xlab("") +
     ylab("") +
@@ -605,7 +682,7 @@ g <- ggplot() +
                     values = pal_wall) +
   guides(color=guide_legend(nrow=2, byrow=TRUE)) 
 g
-ggsave(g, file = "./Outputs/Fig2.png", width = 90, height = 200, units = "mm", dpi = 600)
+ggsave(g, file = "./Outputs/Fig1.png", width = 90, height = 200, units = "mm", dpi = 600)
 ```
 
 ## Scar scores through time
@@ -849,8 +926,8 @@ base_proportions <- perp_bestid_df %>%
 
 # prevalence of scars in the pop (based on Robbins et al scoring approach)
 # between 2016 and 2023 - minimum Perp estimate for E4 and E3
-base_ent <- base_proportions[base_proportions$Perp_Entang %in% c("E4"), ]$percent/100 +
-  base_proportions[base_proportions$Perp_Entang %in% c("E3"), ]$percent/100 
+(base_ent <- base_proportions[base_proportions$Perp_Entang %in% c("E4"), ]$percent/100 +
+  base_proportions[base_proportions$Perp_Entang %in% c("E3"), ]$percent/100) 
 
 # baseline sample of the population entanglement status 
 dref <- perp_bestid_df %>% 
@@ -882,6 +959,12 @@ b <- hb_or_df %>%
 # resighting rate
 resight_rate <- 100 - b * 100 / a
 resight_rate
+
+# number of whales seen more than once
+hb_or_df %>% 
+  ddply(., ~ID, function(d){data.frame(nb_sightings = nrow(d))}) %>% 
+  filter(nb_sightings > 1) %>% 
+  nrow()
 
 ####################################
 ### Set scenarios and conditions ###
